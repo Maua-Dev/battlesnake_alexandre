@@ -31,7 +31,7 @@ pub fn info() -> Value {
         "apiversion": "1",
         "author": "xandealee",          // TODO: coloque aqui o SEU usuário do Battlesnake
         "color": "#008a25",    // TODO: escolha a cor da sua cobra
-        "head": "tiger-king",  // TODO: escolha a cabeça
+        "head": "HLM",  // TODO: escolha a cabeça
         "tail": "hook",        // TODO: escolha a cauda
         "version": "1.0.0"
     })
