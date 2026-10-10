@@ -12,11 +12,13 @@
 // para trás (ela morreria na hora). Os TODOs marcam os próximos passos.
 // Documentação: https://docs.battlesnake.com
 
+use crate::models::Battlesnake;
 use crate::models::GameState;
 use rand::seq::IndexedRandom;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 use tracing::info;
 
 /// GET / — chamado quando você cadastra a cobra no site e a cada partida.
@@ -28,7 +30,7 @@ pub fn info() -> Value {
     json!({
         "apiversion": "1",
         "author": "xandealee",          // TODO: coloque aqui o SEU usuário do Battlesnake
-        "color": "#5a008b",    // TODO: escolha a cor da sua cobra
+        "color": "#008a25",    // TODO: escolha a cor da sua cobra
         "head": "tiger-king",  // TODO: escolha a cabeça
         "tail": "hook",        // TODO: escolha a cauda
         "version": "1.0.0"
@@ -142,6 +144,616 @@ fn flood_fill(
     count
 }
 
+// ---------------------------------------------------------------------------
+// Busca com lookahead: minimax com movimentos simultâneos + alpha-beta,
+// aprofundamento iterativo e avaliação por território (Voronoi).
+// ---------------------------------------------------------------------------
+
+const NO_CELL: usize = usize::MAX;
+const HAZARD_DAMAGE: i32 = 14;
+const INF: i32 = 1_000_000;
+const WIN: i32 = 100_000;
+const LOSS: i32 = -100_000;
+const DRAW: i32 = -30_000;
+const UNREACHABLE: i32 = 10_000;
+const MAX_DEPTH: i32 = 24;
+/// Quantos inimigos (os mais próximos) são testados em todas as respostas.
+const FULL_BRANCH_OPPONENTS: usize = 2;
+/// Fração do timeout (em %) usada pela busca. Sobra o resto para rede/Lambda.
+const BUDGET_PERCENT: i64 = 45;
+
+/// Geometria do tabuleiro: célula = y * largura + x, vizinhos pré-calculados.
+struct Geo {
+    width: i32,
+    height: i32,
+    cells: usize,
+    nbr: Vec<[usize; 4]>,
+    hazard: Vec<i32>,
+}
+
+impl Geo {
+    fn new(state: &GameState) -> Geo {
+        let width = state.board.width;
+        let height = state.board.height;
+        let cells = (width * height) as usize;
+        let mut nbr = vec![[NO_CELL; 4]; cells];
+        for y in 0..height {
+            for x in 0..width {
+                for (d, &(_, dx, dy)) in DIRECTIONS.iter().enumerate() {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if in_bounds(nx, ny, width, height) {
+                        nbr[(y * width + x) as usize][d] = (ny * width + nx) as usize;
+                    }
+                }
+            }
+        }
+        let mut hazard = vec![0; cells];
+        for c in &state.board.hazards {
+            if in_bounds(c.x, c.y, width, height) {
+                hazard[(c.y * width + c.x) as usize] += 1;
+            }
+        }
+        Geo { width, height, cells, nbr, hazard }
+    }
+
+    fn cell(&self, x: i32, y: i32) -> usize {
+        (y * self.width + x) as usize
+    }
+
+    fn manhattan(&self, a: usize, b: usize) -> i32 {
+        let w = self.width as usize;
+        ((a % w) as i32 - (b % w) as i32).abs() + ((a / w) as i32 - (b / w) as i32).abs()
+    }
+
+    /// rel[casa] = em quantos turnos a casa fica livre (0 = livre agora,
+    /// 1 = rabo que sai neste turno).
+    fn release(&self, s: &Sim, rel: &mut [i32]) {
+        rel.fill(0);
+        for sn in &s.snakes {
+            if !sn.alive {
+                continue;
+            }
+            let len = sn.body.len();
+            for (k, &c) in sn.body.iter().enumerate() {
+                let r = (len - k) as i32;
+                if r > rel[c] {
+                    rel[c] = r;
+                }
+            }
+        }
+    }
+}
+
+/// Cobra do modelo interno. body[0] é a cabeça.
+#[derive(Clone)]
+struct Snk {
+    body: Vec<usize>,
+    health: i32,
+    alive: bool,
+}
+
+/// Estado simulado. snakes[0] é sempre a minha cobra.
+#[derive(Clone)]
+struct Sim {
+    food: Vec<bool>,
+    snakes: Vec<Snk>,
+}
+
+fn to_snk(geo: &Geo, snake: &Battlesnake) -> Option<Snk> {
+    let head = snake.body.first()?;
+    if !in_bounds(head.x, head.y, geo.width, geo.height) {
+        return None;
+    }
+    let body: Vec<usize> = snake
+        .body
+        .iter()
+        .filter(|c| in_bounds(c.x, c.y, geo.width, geo.height))
+        .map(|c| geo.cell(c.x, c.y))
+        .collect();
+    Some(Snk { body, health: snake.health as i32, alive: true })
+}
+
+fn build_sim(state: &GameState, geo: &Geo) -> Option<Sim> {
+    let mut snakes = vec![to_snk(geo, &state.you)?];
+    for other in &state.board.snakes {
+        if other.id == state.you.id {
+            continue;
+        }
+        if let Some(snk) = to_snk(geo, other) {
+            snakes.push(snk);
+        }
+    }
+    let mut food = vec![false; geo.cells];
+    for f in &state.board.food {
+        if in_bounds(f.x, f.y, geo.width, geo.height) {
+            food[geo.cell(f.x, f.y)] = true;
+        }
+    }
+    Some(Sim { food, snakes })
+}
+
+/// BFS em turnos a partir de uma cabeça, respeitando rabos que vão sair.
+fn bfs(geo: &Geo, rel: &[i32], head: usize, dist: &mut [i32], queue: &mut Vec<usize>) {
+    dist.fill(UNREACHABLE);
+    queue.clear();
+    dist[head] = 0;
+    queue.push(head);
+    let mut qh = 0;
+    while qh < queue.len() {
+        let cell = queue[qh];
+        qh += 1;
+        let nd = dist[cell] + 1;
+        for &nn in &geo.nbr[cell] {
+            if nn == NO_CELL || dist[nn] != UNREACHABLE || rel[nn] > nd {
+                continue;
+            }
+            dist[nn] = nd;
+            queue.push(nn);
+        }
+    }
+}
+
+fn promote(moves: &mut [usize], preferred: usize) {
+    if let Some(i) = moves.iter().position(|&m| m == preferred) {
+        moves[..=i].rotate_right(1);
+    }
+}
+
+struct Search<'a> {
+    geo: &'a Geo,
+    deadline: Instant,
+    had_opponents: bool,
+    timed_out: bool,
+    nodes: u64,
+    completed_depth: i32,
+    root_order: Vec<usize>,
+    root_best: Option<usize>,
+    // buffers reutilizáveis da avaliação
+    rel_eval: Vec<i32>,
+    dist: Vec<Vec<i32>>,
+    queue: Vec<usize>,
+}
+
+impl<'a> Search<'a> {
+    fn new(geo: &'a Geo, deadline: Instant, snakes: usize) -> Search<'a> {
+        Search {
+            geo,
+            deadline,
+            had_opponents: snakes > 1,
+            timed_out: false,
+            nodes: 0,
+            completed_depth: 0,
+            root_order: Vec::new(),
+            root_best: None,
+            rel_eval: vec![0; geo.cells],
+            dist: vec![vec![UNREACHABLE; geo.cells]; snakes],
+            queue: Vec::with_capacity(geo.cells),
+        }
+    }
+
+    fn expired(&mut self) -> bool {
+        if !self.timed_out && Instant::now() >= self.deadline {
+            self.timed_out = true;
+        }
+        self.timed_out
+    }
+
+    /// Aprofundamento iterativo: refaz a busca com profundidade 1, 2, 3...
+    /// e guarda a melhor jogada da última profundidade COMPLETA.
+    fn run(&mut self, root: &Sim) -> Option<usize> {
+        let geo = self.geo;
+        let mut rel = vec![0; geo.cells];
+        geo.release(root, &mut rel);
+        let legal = self.legal_moves(root, 0, &rel);
+        if legal.len() == 1 {
+            return Some(legal[0]);
+        }
+        self.root_order = self.order_moves(root, 0, legal, &rel);
+
+        let mut best = None;
+        for depth in 1..=MAX_DEPTH {
+            self.root_best = None;
+            let v = self.value(root, depth, -INF, INF, true);
+            if self.timed_out {
+                break;
+            }
+            self.completed_depth = depth;
+            if let Some(m) = self.root_best {
+                best = Some(m);
+                promote(&mut self.root_order, m);
+            }
+            if v > WIN / 2 {
+                break; // vitória forçada encontrada
+            }
+        }
+        best.or_else(|| self.root_order.first().copied())
+    }
+
+    /// valor(nó) = max sobre meus movimentos de min sobre as respostas
+    /// conjuntas dos inimigos (todos se movem ao mesmo tempo).
+    fn value(&mut self, s: &Sim, depth: i32, mut alpha: i32, beta: i32, is_root: bool) -> i32 {
+        if self.expired() {
+            return 0;
+        }
+        self.nodes += 1;
+
+        let n = s.snakes.len();
+        let alive_opps = (1..n).filter(|&i| s.snakes[i].alive).count();
+
+        if !s.snakes[0].alive {
+            return if self.had_opponents && alive_opps == 0 { DRAW } else { LOSS - depth };
+        }
+        if self.had_opponents && alive_opps == 0 {
+            return WIN + depth;
+        }
+        if depth == 0 {
+            return self.eval(s);
+        }
+
+        let geo = self.geo;
+        let mut rel = vec![0; geo.cells];
+        geo.release(s, &mut rel);
+
+        let my_moves = if is_root {
+            self.root_order.clone()
+        } else {
+            let legal = self.legal_moves(s, 0, &rel);
+            self.order_moves(s, 0, legal, &rel)
+        };
+
+        // Inimigos mais próximos da minha cabeça primeiro.
+        let my_head = s.snakes[0].body[0];
+        let mut opps: Vec<usize> = (1..n).filter(|&i| s.snakes[i].alive).collect();
+        opps.sort_by_key(|&i| geo.manhattan(s.snakes[i].body[0], my_head));
+        let mut k = opps.len().min(FULL_BRANCH_OPPONENTS);
+        while k < opps.len() && geo.manhattan(s.snakes[opps[k]].body[0], my_head) <= 2 {
+            k += 1;
+        }
+
+        // Os k primeiros são testados em todas as respostas; os demais
+        // fazem um único movimento "provável".
+        let mut mv = vec![NO_CELL; n];
+        let mut full_moves: Vec<Vec<usize>> = Vec::new();
+        for (j, &i) in opps.iter().enumerate() {
+            let legal = self.legal_moves(s, i, &rel);
+            let ordered = self.order_moves(s, i, legal, &rel);
+            if j < k {
+                full_moves.push(ordered);
+            } else {
+                mv[i] = ordered[0];
+            }
+        }
+
+        let mut best = -INF;
+        for &m in &my_moves {
+            mv[0] = m;
+            let mut pos = vec![0usize; k];
+            let mut cur = INF;
+
+            loop {
+                if self.expired() {
+                    return 0;
+                }
+                for j in 0..k {
+                    mv[opps[j]] = full_moves[j][pos[j]];
+                }
+
+                let child = self.step(s, &mv);
+                let v = self.value(&child, depth - 1, alpha, beta.min(cur), false);
+                if self.timed_out {
+                    return 0;
+                }
+                if v < cur {
+                    cur = v;
+                }
+                if cur <= alpha {
+                    break; // poda: o adversário já me garante menos que o que tenho
+                }
+
+                // Próxima combinação de respostas (odômetro).
+                let mut advanced = false;
+                for j in (0..k).rev() {
+                    pos[j] += 1;
+                    if pos[j] < full_moves[j].len() {
+                        advanced = true;
+                        break;
+                    }
+                    pos[j] = 0;
+                }
+                if !advanced {
+                    break;
+                }
+            }
+
+            if cur > best {
+                best = cur;
+                if is_root {
+                    self.root_best = Some(m);
+                }
+            }
+            if best > alpha {
+                alpha = best;
+            }
+            if alpha >= beta {
+                break;
+            }
+        }
+        best
+    }
+
+    /// Movimentos que não matam na hora (parede/corpo). O rabo comum sai do
+    /// lugar; o rabo "empilhado" (cobra que acabou de comer) não.
+    fn legal_moves(&self, s: &Sim, i: usize, rel: &[i32]) -> Vec<usize> {
+        let body = &s.snakes[i].body;
+        let head = body[0];
+        let mut result = Vec::with_capacity(4);
+        let mut any_dir = None;
+        for d in 0..4 {
+            let next = self.geo.nbr[head][d];
+            if next == NO_CELL {
+                continue;
+            }
+            any_dir.get_or_insert(d);
+            if body.len() > 1 && next == body[1] {
+                continue;
+            }
+            if rel[next] > 1 {
+                continue;
+            }
+            result.push(d);
+        }
+        if result.is_empty() {
+            result.push(any_dir.unwrap_or(0)); // todas matam: a cobra morre na simulação
+        }
+        result
+    }
+
+    /// Nota rápida de um movimento, só para ORDENAR a busca (melhora a poda).
+    fn move_score(&self, s: &Sim, i: usize, d: usize, rel: &[i32]) -> i32 {
+        let sn = &s.snakes[i];
+        let next = self.geo.nbr[sn.body[0]][d];
+        if next == NO_CELL || rel[next] > 1 {
+            return LOSS;
+        }
+        let hp = if s.food[next] {
+            100
+        } else {
+            sn.health - 1 - self.geo.hazard[next] * HAZARD_DAMAGE
+        };
+        if hp <= 0 {
+            return LOSS + hp;
+        }
+        let mut score = 0;
+        // risco de head-to-head contra cobras maiores ou iguais
+        for (j, o) in s.snakes.iter().enumerate() {
+            if j != i && o.alive && o.body.len() >= sn.body.len()
+                && self.geo.nbr[o.body[0]].contains(&next)
+            {
+                score -= 20_000;
+            }
+        }
+        let exits = self.geo.nbr[next]
+            .iter()
+            .filter(|&&a| a != NO_CELL && a != sn.body[0] && rel[a] <= 2)
+            .count() as i32;
+        score += 70 * exits + hp - 8 * self.geo.hazard[next] * HAZARD_DAMAGE;
+        let nearest = (0..self.geo.cells)
+            .filter(|&c| s.food[c])
+            .map(|c| self.geo.manhattan(next, c))
+            .min();
+        if let Some(dist) = nearest {
+            score -= (if sn.health < 40 { 12 } else { 2 }) * dist;
+        }
+        if s.food[next] {
+            score += if sn.health < 40 { 600 } else { 90 };
+        }
+        score
+    }
+
+    fn order_moves(&self, s: &Sim, i: usize, moves: Vec<usize>, rel: &[i32]) -> Vec<usize> {
+        let mut scored: Vec<(i32, usize)> = moves
+            .into_iter()
+            .map(|d| (self.move_score(s, i, d, rel), d))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.into_iter().map(|(_, d)| d).collect()
+    }
+
+    /// Simula UM turno com as regras padrão: mover, perder vida (e hazard),
+    /// comer/crescer e eliminar (parede, corpo, head-to-head).
+    fn step(&self, s: &Sim, mv: &[usize]) -> Sim {
+        let geo = self.geo;
+        let n = s.snakes.len();
+        let mut next = s.clone();
+        let mut ate = vec![false; n];
+
+        for i in 0..n {
+            if !next.snakes[i].alive {
+                continue;
+            }
+            let head = next.snakes[i].body[0];
+            let nc = if mv[i] < 4 { geo.nbr[head][mv[i]] } else { NO_CELL };
+            let sn = &mut next.snakes[i];
+            if nc == NO_CELL {
+                sn.alive = false; // saiu do tabuleiro
+                continue;
+            }
+            sn.body.rotate_right(1);
+            sn.body[0] = nc;
+            if s.food[nc] {
+                ate[i] = true;
+                sn.health = 100;
+            } else {
+                sn.health -= 1 + geo.hazard[nc] * HAZARD_DAMAGE;
+                if sn.health <= 0 {
+                    sn.alive = false;
+                }
+            }
+        }
+
+        // Quem comeu cresce (rabo duplicado) e a comida some.
+        for i in 0..n {
+            if ate[i] {
+                let sn = &mut next.snakes[i];
+                let last = *sn.body.last().unwrap();
+                sn.body.push(last);
+                next.food[sn.body[0]] = false;
+            }
+        }
+
+        // Colisões, todas calculadas sobre o mesmo estado.
+        let contender: Vec<bool> = next.snakes.iter().map(|sn| sn.alive).collect();
+        let mut kill = vec![false; n];
+        for i in 0..n {
+            if !contender[i] {
+                continue;
+            }
+            let head = next.snakes[i].body[0];
+            for j in 0..n {
+                if !contender[j] {
+                    continue;
+                }
+                let other = &next.snakes[j].body;
+                if other[1..].contains(&head)
+                    || (j != i && other[0] == head && other.len() >= next.snakes[i].body.len())
+                {
+                    kill[i] = true;
+                    break;
+                }
+            }
+        }
+        for i in 0..n {
+            if kill[i] {
+                next.snakes[i].alive = false;
+            }
+        }
+        next
+    }
+
+    /// Avaliação de uma posição, do meu ponto de vista.
+    fn eval(&mut self, s: &Sim) -> i32 {
+        let geo = self.geo;
+        let n = s.snakes.len();
+        geo.release(s, &mut self.rel_eval);
+
+        for i in 0..n {
+            if s.snakes[i].alive {
+                bfs(geo, &self.rel_eval, s.snakes[i].body[0], &mut self.dist[i], &mut self.queue);
+            }
+        }
+
+        // Território (Voronoi): cada casa é de quem chega primeiro.
+        // Empate: vence a cobra estritamente maior; senão, ninguém.
+        let mut territory = vec![0i32; n];
+        for c in 0..geo.cells {
+            let best_d = (0..n)
+                .filter(|&i| s.snakes[i].alive)
+                .map(|i| self.dist[i][c])
+                .min()
+                .unwrap_or(UNREACHABLE);
+            if best_d >= UNREACHABLE {
+                continue;
+            }
+            let mut winner = 0;
+            let mut winner_len = 0;
+            let mut unique = true;
+            for i in 0..n {
+                if !s.snakes[i].alive || self.dist[i][c] != best_d {
+                    continue;
+                }
+                let len = s.snakes[i].body.len();
+                if len > winner_len {
+                    winner_len = len;
+                    winner = i;
+                    unique = true;
+                } else if len == winner_len {
+                    unique = false;
+                }
+            }
+            if unique {
+                territory[winner] += 1;
+            }
+        }
+
+        let me = &s.snakes[0];
+        let my_len = me.body.len() as i32;
+        let mut opp_max_cells = 0;
+        let mut opp_max_len = 0;
+        for i in 1..n {
+            if s.snakes[i].alive {
+                opp_max_cells = opp_max_cells.max(territory[i]);
+                opp_max_len = opp_max_len.max(s.snakes[i].body.len() as i32);
+            }
+        }
+
+        let self_space = self.dist[0].iter().filter(|&&d| d < UNREACHABLE).count() as i32;
+        let nearest_food = (0..geo.cells)
+            .filter(|&c| s.food[c] && self.dist[0][c] < UNREACHABLE)
+            .map(|c| self.dist[0][c])
+            .min();
+        let has_food = s.food.iter().any(|&f| f);
+
+        let mut score = 0;
+
+        // Território: o que mais separa cobras fortes de fracas.
+        score += 14 * territory[0] - 6 * opp_max_cells;
+
+        // Tamanho: ser maior vence os head-to-head.
+        let diff = if opp_max_len == 0 { 0 } else { (my_len - opp_max_len).clamp(-4, 4) };
+        score += 25 * diff + 18 * my_len;
+
+        // Armadilha: região alcançável menor que o meu corpo.
+        if self_space < my_len {
+            score -= 3000 + 300 * (my_len - self_space);
+        }
+
+        // Fome.
+        if me.health < 35 {
+            score -= (35 - me.health) * 20;
+        }
+        let pull = 2 + if me.health < 60 { (60 - me.health) / 4 } else { 0 } + if diff <= 0 { 2 } else { 0 };
+        match nearest_food {
+            Some(d) => score -= pull * d.min(25),
+            None if has_food => score -= 150 + (100 - me.health) * 5,
+            None => {}
+        }
+        score += me.health / 5;
+
+        // Hazard na cabeça.
+        score -= 4 * HAZARD_DAMAGE * geo.hazard[me.body[0]];
+
+        // Resultado terminal sempre supera qualquer avaliação heurística.
+        score.clamp(LOSS / 2, WIN / 2)
+    }
+}
+
+/// Roda a busca dentro do orçamento de tempo. None = não foi possível montar
+/// o estado (aí o get_move cai na lógica antiga abaixo).
+fn search_best_move(state: &GameState) -> Option<&'static str> {
+    let geo = Geo::new(state);
+    let sim = build_sim(state, &geo)?;
+
+    let timeout = state.game.timeout as i64;
+    let timeout = if timeout <= 0 { 500 } else { timeout };
+    let mut budget_ms = (timeout * BUDGET_PERCENT / 100).max(30) as u64;
+    if cfg!(test) {
+        budget_ms = 15; // testes rápidos
+    }
+
+    let started = Instant::now();
+    let mut search = Search::new(&geo, started + Duration::from_millis(budget_ms), sim.snakes.len());
+    let mv = search.run(&sim)?;
+    info!(
+        "BUSCA turno {}: {} (profundidade {}, {} nós, {} ms)",
+        state.turn,
+        DIRECTIONS[mv].0,
+        search.completed_depth,
+        search.nodes,
+        started.elapsed().as_millis()
+    );
+    Some(DIRECTIONS[mv].0)
+}
+
 /// POST /move — chamado a cada turno. Aqui mora a inteligência da sua cobra.
 /// Precisa devolver "up", "down", "left" ou "right".
 /// Exemplo do JSON recebido: https://docs.battlesnake.com/api/example-move
@@ -232,6 +844,12 @@ pub fn get_move(state: &GameState) -> Value {
                 is_move_safe.insert("down", false);
             }
         }
+    }
+
+    // [Busca com lookahead] Primeira escolha: olha vários turnos à frente.
+    // Se não conseguir montar o estado, segue para a lógica anterior abaixo.
+    if let Some(best_move) = search_best_move(state) {
+        return json!({ "move": best_move });
     }
 
     // Sobrou alguma direção segura?
@@ -330,14 +948,7 @@ mod tests {
             id: "minha-cobra".to_string(),
             name: "MinhaCobra".to_string(),
             health: 100,
-            body: vec![
-                head,
-                neck,
-                Coord {
-                    x: neck.x,
-                    y: neck.y - 1,
-                },
-            ],
+            body: vec![head, neck, Coord { x: neck.x, y: neck.y - 1 }],
             head,
             length: 3,
             latency: Some("50".to_string()),
@@ -430,8 +1041,8 @@ mod tests {
                 ["up", "down", "left", "right"].contains(&direction.as_str()),
                 "direção inválida: {direction}"
             );
-            assert_ne!(direction, "left", "foi para fora do tabuleiro (esquerda)");
-            assert_ne!(direction, "down", "foi para fora do tabuleiro (baixo)");
+            assert_ne!(direction, "left",  "foi para fora do tabuleiro (esquerda)");
+            assert_ne!(direction, "down",  "foi para fora do tabuleiro (baixo)");
         }
     }
 
@@ -494,7 +1105,12 @@ mod tests {
     #[test]
     fn vai_em_direcao_a_comida() {
         // cabeça (5,4), pescoço à esquerda, comida em (5,5) logo acima
-        let state = game_state(Coord { x: 5, y: 4 }, Coord { x: 4, y: 4 });
+        let mut state = game_state(Coord { x: 5, y: 4 }, Coord { x: 4, y: 4 });
+        state.you.health = 20; // com fome, a comida pesa mais que o território
+        state.board.snakes = vec![
+            state.you.clone(),
+            enemy("longe", vec![Coord { x: 10, y: 10 }, Coord { x: 10, y: 9 }, Coord { x: 10, y: 8 }]),
+        ];
         assert_eq!(chosen_move(&state), "up");
     }
 
@@ -502,15 +1118,10 @@ mod tests {
     fn nao_bate_no_corpo_da_adversaria() {
         let mut state = game_state(Coord { x: 5, y: 4 }, Coord { x: 4, y: 4 });
         state.board.food = vec![Coord { x: 9, y: 4 }]; // comida à direita
-                                                       // corpo da adversária bloqueando (6,4), logo à direita
+        // corpo da adversária bloqueando (6,4), logo à direita
         state.board.snakes.push(enemy(
             "inimiga",
-            vec![
-                Coord { x: 6, y: 6 },
-                Coord { x: 6, y: 5 },
-                Coord { x: 6, y: 4 },
-                Coord { x: 6, y: 3 },
-            ],
+            vec![Coord { x: 6, y: 6 }, Coord { x: 6, y: 5 }, Coord { x: 6, y: 4 }, Coord { x: 6, y: 3 }],
         ));
         for _ in 0..30 {
             assert_ne!(chosen_move(&state), "right");
@@ -524,12 +1135,7 @@ mod tests {
         // adversária maior com a cabeça em (7,4): a casa (6,4) é perigosa
         state.board.snakes.push(enemy(
             "inimiga",
-            vec![
-                Coord { x: 7, y: 4 },
-                Coord { x: 8, y: 4 },
-                Coord { x: 9, y: 4 },
-                Coord { x: 9, y: 5 },
-            ],
+            vec![Coord { x: 7, y: 4 }, Coord { x: 8, y: 4 }, Coord { x: 9, y: 4 }, Coord { x: 9, y: 5 }],
         ));
         for _ in 0..30 {
             assert_ne!(chosen_move(&state), "right");
@@ -543,14 +1149,8 @@ mod tests {
         let mut state = game_state(head, Coord { x: 4, y: 5 });
         state.board.food = vec![Coord { x: 5, y: 6 }];
         state.you.body = vec![
-            head,
-            Coord { x: 4, y: 5 },
-            Coord { x: 4, y: 6 },
-            Coord { x: 4, y: 7 },
-            Coord { x: 5, y: 7 },
-            Coord { x: 6, y: 7 },
-            Coord { x: 6, y: 6 },
-            Coord { x: 7, y: 6 },
+            head, Coord { x: 4, y: 5 }, Coord { x: 4, y: 6 }, Coord { x: 4, y: 7 },
+            Coord { x: 5, y: 7 }, Coord { x: 6, y: 7 }, Coord { x: 6, y: 6 }, Coord { x: 7, y: 6 },
         ];
         state.you.health = 80;
         state.board.snakes = vec![state.you.clone()];
